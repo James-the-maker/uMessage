@@ -1,9 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const path = require('path');
+const mongoose = require('mongoose');
 
 const app = express();
 app.use(cors());
@@ -11,28 +10,46 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-umessage-key';
-const DB_FILE = path.join(__dirname, 'database.json');
+const MONGO_URI = process.env.MONGO_URI;
 
-// Initialize database if it doesn't exist
-if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify({ users: [], posts: [], messages: [] }));
-}
+// Connect to MongoDB
+mongoose.connect(MONGO_URI)
+    .then(() => console.log('Connected to MongoDB Atlas'))
+    .catch(err => console.error('MongoDB connection error:', err));
 
-// Helper to read/write DB
-const readDB = () => JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
-const writeDB = (data) => fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+// --- SCHEMAS ---
+const userSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    friendCode: { type: String, required: true, unique: true },
+    friends: [String]
+});
+const User = mongoose.model('User', userSchema);
+
+const postSchema = new mongoose.Schema({
+    authorId: String,
+    authorName: String,
+    content: String,
+    timestamp: { type: Date, default: Date.now },
+    likes: { type: Number, default: 0 }
+});
+const Post = mongoose.model('Post', postSchema);
+
+const messageSchema = new mongoose.Schema({
+    from: String,
+    to: String,
+    content: String,
+    timestamp: { type: Date, default: Date.now }
+});
+const Message = mongoose.model('Message', messageSchema);
 
 // Generate unique Friend Code
-const generateFriendCode = () => {
-    return '#UM-' + Math.random().toString(36).substring(2, 8).toUpperCase();
-};
+const generateFriendCode = () => '#UM-' + Math.random().toString(36).substring(2, 8).toUpperCase();
 
 // Auth Middleware
 const authenticateToken = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
+    const token = req.headers['authorization']?.split(' ')[1];
     if (!token) return res.sendStatus(401);
-
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) return res.sendStatus(403);
         req.user = user;
@@ -42,115 +59,91 @@ const authenticateToken = (req, res, next) => {
 
 // --- ROUTES ---
 
-// 1. Register
+// Register
 app.post('/api/auth/register', async (req, res) => {
-    const { username, password } = req.body;
-    const db = readDB();
-    
-    if (db.users.find(u => u.username === username)) {
-        return res.status(400).json({ error: 'Username already exists' });
+    try {
+        const { username, password } = req.body;
+        if (await User.findOne({ username })) return res.status(400).json({ error: 'Username exists' });
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const newUser = new User({
+            username,
+            password: hashedPassword,
+            friendCode: generateFriendCode(),
+            friends: []
+        });
+        await newUser.save();
+
+        const token = jwt.sign({ id: newUser._id, username: newUser.username, friendCode: newUser.friendCode }, JWT_SECRET);
+        res.json({ token, user: { id: newUser._id, username: newUser.username, friendCode: newUser.friendCode } });
+    } catch (error) {
+        res.status(500).json({ error: 'Registration failed' });
     }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = {
-        id: Date.now().toString(),
-        username,
-        password: hashedPassword,
-        friendCode: generateFriendCode(),
-        friends: [] // Stores friend codes
-    };
-
-    db.users.push(newUser);
-    writeDB(db);
-
-    const token = jwt.sign({ id: newUser.id, username: newUser.username, friendCode: newUser.friendCode }, JWT_SECRET);
-    res.json({ token, user: { id: newUser.id, username: newUser.username, friendCode: newUser.friendCode } });
 });
 
-// 2. Login
+// Login
 app.post('/api/auth/login', async (req, res) => {
-    const { username, password } = req.body;
-    const db = readDB();
-    
-    const user = db.users.find(u => u.username === username);
-    if (!user) return res.status(400).json({ error: 'User not found' });
+    try {
+        const { username, password } = req.body;
+        const user = await User.findOne({ username });
+        if (!user || !(await bcrypt.compare(password, user.password))) {
+            return res.status(400).json({ error: 'Invalid credentials' });
+        }
 
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) return res.status(400).json({ error: 'Invalid password' });
-
-    const token = jwt.sign({ id: user.id, username: user.username, friendCode: user.friendCode }, JWT_SECRET);
-    res.json({ token, user: { id: user.id, username: user.username, friendCode: user.friendCode } });
+        const token = jwt.sign({ id: user._id, username: user.username, friendCode: user.friendCode }, JWT_SECRET);
+        res.json({ token, user: { id: user._id, username: user.username, friendCode: user.friendCode } });
+    } catch (error) {
+        res.status(500).json({ error: 'Login failed' });
+    }
 });
 
-// 3. Add Friend
-app.post('/api/friends/add', authenticateToken, (req, res) => {
-    const { friendCode } = req.body;
-    const db = readDB();
-    
-    const userIndex = db.users.findIndex(u => u.id === req.user.id);
-    const friend = db.users.find(u => u.friendCode === friendCode);
+// Add Friend
+app.post('/api/friends/add', authenticateToken, async (req, res) => {
+    try {
+        const { friendCode } = req.body;
+        const friend = await User.findOne({ friendCode });
+        if (!friend) return res.status(404).json({ error: 'Friend code not found' });
 
-    if (!friend) return res.status(404).json({ error: 'Friend code not found' });
-    if (db.users[userIndex].friends.includes(friendCode)) return res.status(400).json({ error: 'Already friends' });
+        const user = await User.findById(req.user.id);
+        if (user.friends.includes(friendCode)) return res.status(400).json({ error: 'Already friends' });
 
-    db.users[userIndex].friends.push(friendCode);
-    writeDB(db);
-    res.json({ message: 'Friend added!', friend: { username: friend.username, friendCode } });
+        user.friends.push(friendCode);
+        await user.save();
+        res.json({ message: 'Friend added!', friend: { username: friend.username, friendCode } });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to add friend' });
+    }
 });
 
-// 4. Create Post
-app.post('/api/posts', authenticateToken, (req, res) => {
-    const { content } = req.body;
-    const db = readDB();
-    
-    const newPost = {
-        id: Date.now().toString(),
-        authorId: req.user.id,
-        authorName: req.user.username,
-        content,
-        timestamp: new Date().toISOString(),
-        likes: 0
-    };
-
-    db.posts.unshift(newPost);
-    writeDB(db);
-    res.json(newPost);
+// Create Post
+app.post('/api/posts', authenticateToken, async (req, res) => {
+    const post = new Post({ authorId: req.user.id, authorName: req.user.username, content: req.body.content });
+    await post.save();
+    res.json(post);
 });
 
-// 5. Get Feed
-app.get('/api/posts', authenticateToken, (req, res) => {
-    const db = readDB();
-    res.json(db.posts);
+// Get Feed
+app.get('/api/posts', authenticateToken, async (req, res) => {
+    const posts = await Post.find().sort({ timestamp: -1 }).limit(50);
+    res.json(posts);
 });
 
-// 6. Send Direct Message
-app.post('/api/messages', authenticateToken, (req, res) => {
-    const { toFriendCode, content } = req.body;
-    const db = readDB();
-    
-    const newMessage = {
-        id: Date.now().toString(),
-        from: req.user.friendCode,
-        to: toFriendCode,
-        content,
-        timestamp: new Date().toISOString()
-    };
-
-    db.messages.push(newMessage);
-    writeDB(db);
-    res.json(newMessage);
+// Send Message
+app.post('/api/messages', authenticateToken, async (req, res) => {
+    const msg = new Message({ from: req.user.friendCode, to: req.body.toFriendCode, content: req.body.content });
+    await msg.save();
+    res.json(msg);
 });
 
-// 7. Get Messages
-app.get('/api/messages/:friendCode', authenticateToken, (req, res) => {
-    const db = readDB();
-    const chatHistory = db.messages.filter(m => 
-        (m.from === req.user.friendCode && m.to === req.params.friendCode) ||
-        (m.from === req.params.friendCode && m.to === req.user.friendCode)
-    );
-    res.json(chatHistory);
+// Get Messages
+app.get('/api/messages/:friendCode', authenticateToken, async (req, res) => {
+    const messages = await Message.find({
+        $or: [
+            { from: req.user.friendCode, to: req.params.friendCode },
+            { from: req.params.friendCode, to: req.user.friendCode }
+        ]
+    }).sort({ timestamp: 1 });
+    res.json(messages);
 });
 
-app.listen(PORT, () => {
-    console.log(`uMessage backend running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
