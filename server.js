@@ -1,149 +1,200 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const mongoose = require('mongoose');
+const jwt = require('jwt-simple');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-umessage-key';
 const MONGO_URI = process.env.MONGO_URI;
+const JWT_SECRET = process.env.JWT_SECRET || 'umessage_secret_key_123';
 
-// Connect to MongoDB
+// --- Database Connection ---
 mongoose.connect(MONGO_URI)
-    .then(() => console.log('Connected to MongoDB Atlas'))
-    .catch(err => console.error('MongoDB connection error:', err));
+  .then(() => console.log('Connected to MongoDB Atlas'))
+  .catch(err => console.error('MongoDB connection error:', err));
 
-// --- SCHEMAS ---
+// --- Schemas & Models ---
 const userSchema = new mongoose.Schema({
-    username: { type: String, required: true, unique: true },
-    password: { type: String, required: true },
-    friendCode: { type: String, required: true, unique: true },
-    friends: [String]
+  username: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  friends: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }]
 });
-const User = mongoose.model('User', userSchema);
 
 const postSchema = new mongoose.Schema({
-    authorId: String,
-    authorName: String,
-    content: String,
-    timestamp: { type: Date, default: Date.now },
-    likes: { type: Number, default: 0 }
+  author: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  content: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
 });
-const Post = mongoose.model('Post', postSchema);
 
 const messageSchema = new mongoose.Schema({
-    from: String,
-    to: String,
-    content: String,
-    timestamp: { type: Date, default: Date.now }
+  sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  recipient: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  text: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
 });
+
+const User = mongoose.model('User', userSchema);
+const Post = mongoose.model('Post', postSchema);
 const Message = mongoose.model('Message', messageSchema);
 
-// Generate unique Friend Code
-const generateFriendCode = () => '#UM-' + Math.random().toString(36).substring(2, 8).toUpperCase();
-
-// Auth Middleware
+// --- Auth Middleware ---
 const authenticateToken = (req, res, next) => {
-    const token = req.headers['authorization']?.split(' ')[1];
-    if (!token) return res.sendStatus(401);
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.sendStatus(403);
-        req.user = user;
-        next();
-    });
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Access token required' });
+
+  try {
+    const decoded = jwt.decode(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: 'Invalid or expired token' });
+  }
 };
 
-// --- ROUTES ---
+// --- Auth Routes ---
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'All fields required' });
 
-// Register
-app.post('/api/auth/register', async (req, res) => {
-    try {
-        const { username, password } = req.body;
-        if (await User.findOne({ username })) return res.status(400).json({ error: 'Username exists' });
+    const existingUser = await User.findOne({ username });
+    if (existingUser) return res.status(400).json({ error: 'Username already taken' });
 
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const newUser = new User({
-            username,
-            password: hashedPassword,
-            friendCode: generateFriendCode(),
-            friends: []
-        });
-        await newUser.save();
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = new User({ username, password: hashedPassword });
+    await user.save();
 
-        const token = jwt.sign({ id: newUser._id, username: newUser.username, friendCode: newUser.friendCode }, JWT_SECRET);
-        res.json({ token, user: { id: newUser._id, username: newUser.username, friendCode: newUser.friendCode } });
-    } catch (error) {
-        res.status(500).json({ error: 'Registration failed' });
-    }
+    const token = jwt.encode({ id: user._id, username: user.username }, JWT_SECRET);
+    res.json({ token, username: user.username });
+  } catch (err) {
+    res.status(500).json({ error: 'Registration failed' });
+  }
 });
 
-// Login
-app.post('/api/auth/login', async (req, res) => {
-    try {
-        const { username, password } = req.body;
-        const user = await User.findOne({ username });
-        if (!user || !(await bcrypt.compare(password, user.password))) {
-            return res.status(400).json({ error: 'Invalid credentials' });
-        }
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = await User.findOne({ username });
+    if (!user) return res.status(400).json({ error: 'User not found' });
 
-        const token = jwt.sign({ id: user._id, username: user.username, friendCode: user.friendCode }, JWT_SECRET);
-        res.json({ token, user: { id: user._id, username: user.username, friendCode: user.friendCode } });
-    } catch (error) {
-        res.status(500).json({ error: 'Login failed' });
-    }
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) return res.status(400).json({ error: 'Invalid password' });
+
+    const token = jwt.encode({ id: user._id, username: user.username }, JWT_SECRET);
+    res.json({ token, username: user.username });
+  } catch (err) {
+    res.status(500).json({ error: 'Login failed' });
+  }
 });
 
-// Add Friend
+// --- User Profile Route ---
+app.get('/api/users/me', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select('-password');
+    res.json(user);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch user profile' });
+  }
+});
+
+// --- Friends Routes ---
+app.get('/api/friends', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).populate('friends', 'username');
+    res.json(user.friends || []);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch friends' });
+  }
+});
+
 app.post('/api/friends/add', authenticateToken, async (req, res) => {
-    try {
-        const { friendCode } = req.body;
-        const friend = await User.findOne({ friendCode });
-        if (!friend) return res.status(404).json({ error: 'Friend code not found' });
+  try {
+    const { username } = req.body;
+    const friend = await User.findOne({ username });
 
-        const user = await User.findById(req.user.id);
-        if (user.friends.includes(friendCode)) return res.status(400).json({ error: 'Already friends' });
+    if (!friend) return res.status(404).json({ error: 'User not found' });
+    if (friend._id.toString() === req.user.id) return res.status(400).json({ error: 'Cannot add yourself' });
 
-        user.friends.push(friendCode);
-        await user.save();
-        res.json({ message: 'Friend added!', friend: { username: friend.username, friendCode } });
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to add friend' });
+    const user = await User.findById(req.user.id);
+    if (user.friends.includes(friend._id)) {
+      return res.status(400).json({ error: 'Already friends with this user' });
     }
+
+    user.friends.push(friend._id);
+    await user.save();
+
+    // Mutually add friend
+    if (!friend.friends.includes(user._id)) {
+      friend.friends.push(user._id);
+      await friend.save();
+    }
+
+    res.json({ message: 'Friend added successfully!' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to add friend' });
+  }
 });
 
-// Create Post
-app.post('/api/posts', authenticateToken, async (req, res) => {
-    const post = new Post({ authorId: req.user.id, authorName: req.user.username, content: req.body.content });
-    await post.save();
-    res.json(post);
-});
-
-// Get Feed
+// --- Feed Routes ---
 app.get('/api/posts', authenticateToken, async (req, res) => {
-    const posts = await Post.find().sort({ timestamp: -1 }).limit(50);
+  try {
+    const posts = await Post.find().populate('author', 'username').sort({ createdAt: -1 });
     res.json(posts);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch posts' });
+  }
 });
 
-// Send Message
-app.post('/api/messages', authenticateToken, async (req, res) => {
-    const msg = new Message({ from: req.user.friendCode, to: req.body.toFriendCode, content: req.body.content });
-    await msg.save();
-    res.json(msg);
+app.post('/api/posts', authenticateToken, async (req, res) => {
+  try {
+    const { content } = req.body;
+    if (!content) return res.status(400).json({ error: 'Content is required' });
+
+    const post = new Post({ author: req.user.id, content });
+    await post.save();
+    
+    const populatedPost = await post.populate('author', 'username');
+    res.json(populatedPost);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create post' });
+  }
 });
 
-// Get Messages
-app.get('/api/messages/:friendCode', authenticateToken, async (req, res) => {
+// --- Messages Routes ---
+app.get('/api/messages/:friendId', authenticateToken, async (req, res) => {
+  try {
     const messages = await Message.find({
-        $or: [
-            { from: req.user.friendCode, to: req.params.friendCode },
-            { from: req.params.friendCode, to: req.user.friendCode }
-        ]
-    }).sort({ timestamp: 1 });
+      $or: [
+        { sender: req.user.id, recipient: req.params.friendId },
+        { sender: req.params.friendId, recipient: req.user.id }
+      ]
+    }).sort({ createdAt: 1 });
+
     res.json(messages);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch messages' });
+  }
 });
 
-app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+app.post('/api/messages', authenticateToken, async (req, res) => {
+  try {
+    const { recipientId, text } = req.body;
+    if (!recipientId || !text) return res.status(400).json({ error: 'Recipient and text required' });
+
+    const message = new Message({ sender: req.user.id, recipient: recipientId, text });
+    await message.save();
+
+    res.json(message);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Backend running on port ${PORT}`);
+});
